@@ -1,176 +1,362 @@
+"""AirPods Battery Monitor.
+
+This module provides functionality to monitor the battery status of Apple AirPods devices.
+It uses Bluetooth Low Energy (BLE) to scan for and connect to AirPods devices,
+reading their battery and charging status.
+
+Example:
+    Basic usage with CLI::
+
+        $ python airpods.py --json
+        {
+            "status": 1,
+            "model": "AirPodsMax",
+            "charge": {
+                "left": 95,
+                "right": 95,
+                "case": null
+            },
+            "charging_left": false,
+            "charging_right": false,
+            "charging_case": null,
+            "date": "2025-01-09 22:25:00"
+        }
+"""
+
 import argparse
 import asyncio
-import json
+import logging
+import traceback
 from binascii import hexlify
 from datetime import datetime
+from json import dumps
+from time import time_ns
 
 from bleak import BleakScanner
-from bleak.backends.device import BLEDevice
-from bleak.backends.scanner import AdvertisementData
 
 
 class AirPodsMonitor:
+    """
+    Monitors AirPods battery and charging status using BLE.
+
+    Attributes:
+        AIRPODS_MANUFACTURER: Apple's manufacturer ID for BLE devices
+        RECENT_BEACONS_MAX_T_NS: Maximum time to keep beacon data in nanoseconds
+        MODEL_DATA_LENGTHS: Expected data lengths for different AirPods models
+    """
+
     AIRPODS_MANUFACTURER = 76
-    MIN_RSSI = -70
+    RECENT_BEACONS_MAX_T_NS = 10000000000
 
-    MODEL_IDENTIFIERS = {
-        'a': {'name': 'AirPods Max', 'length': 27},
-        'e': {'name': 'AirPods Pro', 'length': 54},
-        '3': {'name': 'AirPods 3', 'length': 54},
-        'f': {'name': 'AirPods 2', 'length': 54},
-        '2': {'name': 'AirPods 1', 'length': 54},
-    }
+    MODEL_DATA_LENGTHS = {'a': 27, 'e': 54, '3': 54, 'f': 54, '2': 54}
 
-    def __init__(self, debug=False):
-        self.debug = debug
+    def __init__(self, min_rssi=-60):
+        """
+        Initialize AirPods monitor.
+
+        Args:
+            min_rssi: Minimum RSSI value to consider device in range
+        """
+        self.MIN_RSSI = min_rssi
+        self.recent_beacons = []
         self.found_device = None
         self.found_data = None
 
-    async def detection_callback(
-        self,
-        device: BLEDevice,
-        advertisement_data: AdvertisementData,
-    ):
-        if self.debug:
-            print(f'\nFound device: {device.address}')
-            print(f'Name: {device.name}')
-            print(f'RSSI: {advertisement_data.rssi}')
-            print(f'Manufacturer data: {advertisement_data.manufacturer_data}')
+    async def detection_callback(self, device, advertisement_data):
+        """Process discovered BLE device."""
+        logging.debug(f'Found device: {device.address}')
+        logging.debug(f'Advertisement data: {advertisement_data}')
+        logging.debug(f'RSSI: {advertisement_data.rssi}')
 
-        if self.AIRPODS_MANUFACTURER in advertisement_data.manufacturer_data:
+        if (
+            advertisement_data.rssi >= self.MIN_RSSI
+            and self.AIRPODS_MANUFACTURER
+            in advertisement_data.manufacturer_data
+        ):
             data = advertisement_data.manufacturer_data[
                 self.AIRPODS_MANUFACTURER
             ]
-            hex_data = hexlify(data)
 
-            if self.debug:
-                print(f'Apple data length: {len(data)}')
-                print(f'Raw data: {hex_data}')
+            if len(data) >= 27:
+                if (
+                    data[0] == 0x07
+                    or data[0] == 0x01
+                    or data[0] == 0x0A
+                    or data[0] == 0x12
+                ):
+                    best_device = self.get_best_result(
+                        device, advertisement_data
+                    )
+                    if best_device is not None:
+                        self.found_device = best_device['device']
+                        self.found_data = data
 
-            if len(data) == 27 and data[0] == 0x12:
-                self.found_device = device
-                self.found_data = data
+                        logging.debug(f'Found AirPods device: {device.address}')
+                        logging.debug(f'Data prefix: {hex(data[0])}')
+                        logging.debug(
+                            f'Manufacturer data length: {len(self.found_data)}'
+                        )
+                        logging.debug(f'Raw data: {data.hex()}')
+
+    def get_best_result(self, device, advertisement_data):
+        """Get the device with strongest signal from recent beacons."""
+        current_beacon = {
+            'time': time_ns(),
+            'device': device,
+            'rssi': advertisement_data.rssi,
+        }
+
+        self.recent_beacons.append(current_beacon)
+
+        self.recent_beacons = [
+            beacon
+            for beacon in self.recent_beacons
+            if time_ns() - beacon['time'] <= self.RECENT_BEACONS_MAX_T_NS
+        ]
+
+        strongest_beacon = max(
+            self.recent_beacons, key=lambda x: x['rssi'], default=current_beacon
+        )
+
+        if strongest_beacon['device'].address == device.address:
+            return current_beacon
+
+        return strongest_beacon
 
     async def find_airpods(self):
+        """Scan for AirPods devices."""
         try:
-            scanner = BleakScanner(
-                detection_callback=self.detection_callback,
-                scanning_mode='active',
-            )
+            self.found_device = None
+            self.found_data = None
 
-            await scanner.start()
-            await asyncio.sleep(12.0)
-            await scanner.stop()
+            for attempt in range(5):
+                logging.debug(f'\nAttempt {attempt + 1}/5')
 
-            if self.found_data:
-                return hexlify(self.found_data)
+                scanner = BleakScanner(
+                    detection_callback=self.detection_callback,
+                    scanning_mode='active',
+                )
+
+                await scanner.start()
+                await asyncio.sleep(3.0)
+                await scanner.stop()
+
+                if self.found_data and len(self.found_data) >= 27:
+                    logging.debug(
+                        f'Found valid AirPods data with length: {len(self.found_data)}'
+                    )
+                    logging.debug(f'Data: {self.found_data.hex()}')
+                    return hexlify(bytearray(self.found_data))
+
+                if attempt < 4:
+                    await asyncio.sleep(1.0)
+
+            logging.debug('No valid AirPods data found after all attempts')
             return None
 
         except Exception as e:
-            if self.debug:
-                print(f'Error during scanning: {e}')
-                import traceback
-
-                traceback.print_exc()
+            logging.error(f'Error during scanning: {e}')
+            logging.debug(traceback.format_exc())
             return None
 
-    def decode_airpods_max_battery(self, data):
+    def decode_airpods_max_battery(self, raw):
+        """Decode battery and charging status for AirPods Max.
+
+        Decodes data according to the format::
+
+            0x12     - Message type for AirPods Max
+            byte[12] - Battery level (lower 4 bits)
+            byte[14] - Charging flags (0x01 = right, 0x02 = left)
+
+        Args:
+            raw: Raw data in hex format
+
+        Returns:
+            dict: Battery levels and charging status
+        """
         try:
-            if self.debug:
-                print('Raw battery data:', ' '.join(f'{b:02x}' for b in data))
+            raw_bytes = bytes.fromhex(raw.decode())
 
-            battery_byte = data[12]
-            battery_value = battery_byte & 0x0F
+            battery_byte = raw_bytes[12] & 0x0F
+            battery_value = battery_byte
 
-            charging = (data[14] & 0x80) != 0
+            charging_status = raw_bytes[14]
+            charging_right = (charging_status & 0x01) != 0
+            charging_left = (charging_status & 0x02) != 0
 
-            if self.debug:
-                print(f'Battery byte: {battery_byte:02x}')
-                print(f'Battery value: {battery_value}')
-                print(f'Charging: {charging}')
+            logging.debug(f'Raw battery byte: {hex(raw_bytes[12])}')
+            logging.debug(f'Battery value: {battery_value}')
+            logging.debug(f'Raw charging status: {hex(charging_status)}')
+            logging.debug(
+                f'Charging left: {charging_left}, right: {charging_right}'
+            )
 
             return {
                 'left': battery_value,
                 'right': battery_value,
                 'case': None,
-                'charging': {'left': charging, 'right': charging, 'case': None},
+                'charging_left': charging_left,
+                'charging_right': charging_right,
+                'charging_case': None,
             }
         except Exception as e:
-            if self.debug:
-                print(f'Error decoding battery: {e}')
-                import traceback
-
-                traceback.print_exc()
+            logging.error(f'Error decoding AirPods Max battery: {e}')
+            logging.debug(traceback.format_exc())
             return {
                 'left': -1,
                 'right': -1,
                 'case': None,
-                'charging': {'left': False, 'right': False, 'case': None},
+                'charging_left': False,
+                'charging_right': False,
+                'charging_case': None,
             }
 
-    def decode_status(self, hex_data):
+    def decode_regular_airpods(self, raw, flip):
+        """Decode battery and charging status for regular AirPods."""
         try:
-            data = bytes.fromhex(hex_data.decode('utf-8'))
+            raw_bytes = bytes.fromhex(raw.decode())
 
-            if len(data) == 27 and data[0] == 0x12:
-                battery_info = self.decode_airpods_max_battery(data)
-                return {
-                    'status': 1,
-                    'model': 'AirPods Max',
-                    'battery': {
-                        'left': battery_info['left'],
-                        'right': battery_info['right'],
-                        'case': None,
-                    },
-                    'charging': battery_info['charging'],
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'raw_data': hex_data.decode('utf-8')
-                    if self.debug
-                    else None,
+            left_status = raw_bytes[12 if flip else 13] & 0x0F
+            right_status = raw_bytes[13 if flip else 12] & 0x0F
+            case_status = raw_bytes[15] & 0x0F
+
+            charging_byte = raw_bytes[14]
+            charging_left = (
+                charging_byte & (0b00000010 if flip else 0b00000001)
+            ) != 0
+            charging_right = (
+                charging_byte & (0b00000001 if flip else 0b00000010)
+            ) != 0
+            charging_case = (charging_byte & 0b00000100) != 0
+
+            logging.debug(f'Charging byte: {hex(charging_byte)}')
+            logging.debug(f'Flip: {flip}')
+            logging.debug(
+                f'Charging status: L={charging_left}, R={charging_right}, C={charging_case}'
+            )
+
+            return {
+                'left': left_status,
+                'right': right_status,
+                'case': case_status,
+                'charging_left': charging_left,
+                'charging_right': charging_right,
+                'charging_case': charging_case,
+            }
+        except Exception as e:
+            logging.error(f'Error decoding regular AirPods: {e}')
+            logging.debug(traceback.format_exc())
+            return {
+                'left': -1,
+                'right': -1,
+                'case': -1,
+                'charging_left': False,
+                'charging_right': False,
+                'charging_case': False,
+            }
+
+    def is_flipped(self, raw):
+        """Check if left and right AirPods are flipped."""
+        try:
+            raw_bytes = bytes.fromhex(raw.decode())
+            return (raw_bytes[10] & 0x02) == 0
+        except Exception as e:
+            logging.error(f'Error checking flip status: {e}')
+            return False
+
+    async def get_data(self):
+        """Get complete status of AirPods device."""
+        try:
+            raw = await self.find_airpods()
+
+            if raw is None:
+                return dict(status=0, model='AirPods not found')
+
+            raw_bytes = bytes.fromhex(raw.decode())
+            logging.debug(f'Processing raw bytes: {raw_bytes.hex()}')
+
+            message_type = raw_bytes[0]
+
+            if message_type == 0x12 and len(raw_bytes) == 27:
+                logging.debug('Detected AirPods Max format')
+                model = 'AirPodsMax'
+                status_data = self.decode_airpods_max_battery(raw)
+            elif len(raw_bytes) == 54:
+                model_identifier = raw_bytes[7]
+                model_map = {
+                    0x0E: 'AirPodsPro',
+                    0x03: 'AirPods3',
+                    0x0F: 'AirPods2',
+                    0x02: 'AirPods1',
                 }
+                model = model_map.get(model_identifier, 'unknown')
+                logging.debug(f'Model identifier byte: {hex(model_identifier)}')
+                logging.debug(f'Mapped to model: {model}')
 
-            return {'status': 0, 'error': 'Unsupported device type'}
+                if model == 'unknown':
+                    return dict(
+                        status=0,
+                        error=f'Unknown model identifier: {hex(model_identifier)}',
+                    )
+
+                flip = self.is_flipped(raw)
+                status_data = self.decode_regular_airpods(raw, flip)
+            else:
+                return dict(
+                    status=0,
+                    error=f'Invalid data format: message_type={hex(message_type)}, length={len(raw_bytes)}',
+                )
+
+            return dict(
+                status=1,
+                model=model,
+                charge=dict(
+                    left=status_data['left'],
+                    right=status_data['right'],
+                    case=status_data['case'],
+                ),
+                charging_left=status_data['charging_left'],
+                charging_right=status_data['charging_right'],
+                charging_case=status_data['charging_case'],
+                date=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                raw=raw.decode('utf-8')
+                if logging.getLogger().level == logging.DEBUG
+                else None,
+            )
 
         except Exception as e:
-            if self.debug:
-                print(f'Error decoding data: {e}')
-                import traceback
-
-                traceback.print_exc()
-            return {'status': 0, 'error': str(e)}
-
-    async def get_status(self, max_attempts=3):
-        for attempt in range(max_attempts):
-            hex_data = await self.find_airpods()
-            if hex_data is not None:
-                return self.decode_status(hex_data)
-            if attempt < max_attempts - 1:
-                await asyncio.sleep(1)
-        return {'status': 0, 'error': 'AirPods Max not found'}
+            logging.error(f'Error in get_data: {e}')
+            logging.debug(traceback.format_exc())
+            return dict(status=0, error=str(e))
 
 
 def format_output(data):
+    """Format the output data with emoji decorations."""
     if data['status'] == 0:
         return f"❌ Error: {data.get('error', 'Unknown error')}"
 
-    if data['model'] == 'AirPods Max':
-        battery = data['battery']['left']
-        charging = data['charging']['left']
-        return f"🎧 {data['model']}\nBattery: {battery}% {('⚡' if charging else '')}"
-    else:
-        output = [
-            f"🎧 {data['model']}",
-            f"Left:  {data['battery']['left']}% {'⚡' if data['charging']['left'] else ''}",
-            f"Right: {data['battery']['right']}% {'⚡' if data['charging']['right'] else ''}",
-        ]
-        if data['battery']['case'] is not None:
-            output.append(
-                f"Case:  {data['battery']['case']}% {'⚡' if data['charging']['case'] else ''}"
-            )
-        return '\n'.join(output)
+    if data['model'] == 'AirPodsMax':
+        return (
+            f"🎧 {data['model']}\n"
+            f"Battery: {data['charge']['left']}% "
+            f"{'⚡' if data['charging_left'] else ''}"
+        )
+
+    output = [
+        f"🎧 {data['model']}",
+        f"Left:  {data['charge']['left']}% {'⚡' if data['charging_left'] else ''}",
+        f"Right: {data['charge']['right']}% {'⚡' if data['charging_right'] else ''}",
+    ]
+    if data['charge']['case'] is not None:
+        output.append(
+            f"Case:  {data['charge']['case']}% "
+            f"{'⚡' if data['charging_case'] else ''}"
+        )
+    return '\n'.join(output)
 
 
 async def main():
+    """Main function for CLI usage."""
     parser = argparse.ArgumentParser(description='AirPods Battery Monitor')
     parser.add_argument(
         '--json', action='store_true', help='Output in JSON format'
@@ -190,33 +376,42 @@ async def main():
         default=-90,
         help='Minimum RSSI value (default: -90)',
     )
+    parser.add_argument('--output', type=str, help='Output file for logging')
     args = parser.parse_args()
 
-    monitor = AirPodsMonitor(debug=args.debug)
-    monitor.MIN_RSSI = args.min_rssi
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format='%(message)s',
+    )
+
+    monitor = AirPodsMonitor(min_rssi=args.min_rssi)
 
     while True:
         try:
-            status = await monitor.get_status()
+            data = await monitor.get_data()
 
             if args.json:
-                print(json.dumps(status, indent=2))
+                output = dumps(data, indent=2)
             else:
-                print(format_output(status))
+                output = format_output(data)
+
+            print(output)
+
+            if args.output:
+                with open(args.output, 'a') as f:
+                    f.write(f'{output}\n')
 
             if args.interval == 0:
                 break
 
             await asyncio.sleep(args.interval)
+
         except KeyboardInterrupt:
-            print('\nStopping...')
+            logging.info('\nStopping...')
             break
         except Exception as e:
-            print(f'Error: {e}')
-            if args.debug:
-                import traceback
-
-                print(traceback.format_exc())
+            logging.error(f'Error: {e}')
+            logging.debug(traceback.format_exc())
             if args.interval == 0:
                 break
             await asyncio.sleep(1)
