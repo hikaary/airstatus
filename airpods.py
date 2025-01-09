@@ -129,8 +129,8 @@ class AirPodsMonitor:
             self.found_device = None
             self.found_data = None
 
-            for attempt in range(5):
-                logging.debug(f'\nAttempt {attempt + 1}/5')
+            for attempt in range(3):
+                logging.debug(f'\nAttempt {attempt + 1}/3')
 
                 scanner = BleakScanner(
                     detection_callback=self.detection_callback,
@@ -138,7 +138,7 @@ class AirPodsMonitor:
                 )
 
                 await scanner.start()
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(5.0)
                 await scanner.stop()
 
                 if self.found_data and len(self.found_data) >= 27:
@@ -148,7 +148,7 @@ class AirPodsMonitor:
                     logging.debug(f'Data: {self.found_data.hex()}')
                     return hexlify(bytearray(self.found_data))
 
-                if attempt < 4:
+                if attempt < 2:
                     await asyncio.sleep(1.0)
 
             logging.debug('No valid AirPods data found after all attempts')
