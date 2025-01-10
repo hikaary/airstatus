@@ -129,7 +129,7 @@ class AirPodsMonitor:
             self.found_device = None
             self.found_data = None
 
-            for attempt in range(3):
+            for attempt in range(5):
                 logging.debug(f'\nAttempt {attempt + 1}/3')
 
                 scanner = BleakScanner(
@@ -138,7 +138,7 @@ class AirPodsMonitor:
                 )
 
                 await scanner.start()
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(7.0)
                 await scanner.stop()
 
                 if self.found_data and len(self.found_data) >= 27:
@@ -148,8 +148,8 @@ class AirPodsMonitor:
                     logging.debug(f'Data: {self.found_data.hex()}')
                     return hexlify(bytearray(self.found_data))
 
-                if attempt < 2:
-                    await asyncio.sleep(1.0)
+                if attempt < 4:
+                    await asyncio.sleep(2.0)
 
             logging.debug('No valid AirPods data found after all attempts')
             return None
@@ -270,7 +270,12 @@ class AirPodsMonitor:
             raw = await self.find_airpods()
 
             if raw is None:
-                return dict(status=0, model='AirPods not found')
+                return dict(
+                    status=0,
+                    model='AirPods not found',
+                    error='Make sure your AirPods are: 1) Turned on 2) In range 3) Not in case',
+                    suggestion='Try moving closer to your AirPods and ensure they are not in the charging case',
+                )
 
             raw_bytes = bytes.fromhex(raw.decode())
             logging.debug(f'Processing raw bytes: {raw_bytes.hex()}')
@@ -365,12 +370,6 @@ async def main():
         '--debug', action='store_true', help='Enable debug output'
     )
     parser.add_argument(
-        '--interval',
-        type=int,
-        default=0,
-        help='Update interval in seconds (0 for single check)',
-    )
-    parser.add_argument(
         '--min-rssi',
         type=float,
         default=-90,
@@ -386,35 +385,29 @@ async def main():
 
     monitor = AirPodsMonitor(min_rssi=args.min_rssi)
 
-    while True:
-        try:
+    try:
+        data = await monitor.get_data()
+
+        if data['status'] == 0:
+            await asyncio.sleep(1)
             data = await monitor.get_data()
 
-            if args.json:
-                output = dumps(data, indent=2)
-            else:
-                output = format_output(data)
+        if args.json:
+            output = dumps(data, indent=2)
+        else:
+            output = format_output(data)
 
-            print(output)
+        print(output)
 
-            if args.output:
-                with open(args.output, 'a') as f:
-                    f.write(f'{output}\n')
+        if args.output:
+            with open(args.output, 'a') as f:
+                f.write(f'{output}\n')
 
-            if args.interval == 0:
-                break
-
-            await asyncio.sleep(args.interval)
-
-        except KeyboardInterrupt:
-            logging.info('\nStopping...')
-            break
-        except Exception as e:
-            logging.error(f'Error: {e}')
-            logging.debug(traceback.format_exc())
-            if args.interval == 0:
-                break
-            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        logging.info('\nStopping...')
+    except Exception as e:
+        logging.error(f'Error: {e}')
+        logging.debug(traceback.format_exc())
 
 
 if __name__ == '__main__':
